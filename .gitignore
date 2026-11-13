@@ -1,0 +1,18 @@
+# secrets
+.env
+.env.local
+
+# python
+__pycache__/
+*.pyc
+.venv/
+agent/state.json
+agent/work/
+
+# node / next
+node_modules/
+.next/
+bug-ui/tickets.db*
+
+# misc
+.DS_Store
