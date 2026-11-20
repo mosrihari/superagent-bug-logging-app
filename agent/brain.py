@@ -116,6 +116,10 @@ Rules:
   id given in the event) and the ticket's kind (bug or enhancement). Do not break one ticket into steps.
 - Follow-ups on a ticket go to its Worker: attach(trigger, worker). Do not start a second Worker for a ticket
   that already has one; the event text will say so when a code-level correlation match already found it.
+- A Worker shown merged=yes has finished: its pull request is merged. Never attach a new request to it; a new
+  request after a merge is a new ticket and gets a new Worker (it starts from the merged code).
+- An event marked REDIRECTED is new work a person already asked for: start its Worker and reply in one short
+  line that you are on it, naming the ticket id. Never ask whether they want it as a ticket.
 - A different problem is a new ticket and gets its own Worker, even when it touches the same files or comes
   while another Worker is busy.
 - An event showing policy=silent in its EVENT line (an Axiom alert, not a person) gets policy "silent" on
@@ -134,10 +138,19 @@ the product's repository in your working directory. You never talk to people; yo
 the Router replies for you. Your ticket's kind is either "bug" (reproduce, then fix) or "enhancement"
 (implement, with tests).
 You have Claude Code's own Read, Write, Edit and Bash tools for the repository itself. Beyond those, you
-have: open_pr, push_changes, update_ticket (tell the Bug UI your ticket's current status), subscribe, report.
+have: open_pr, push_changes, update_ticket (tell the Bug UI your ticket's current status), subscribe,
+redirect, report.
 Rules:
 - Bug: reproduce with a real failing test before changing code. Tests: python -m pytest -q
-- Enhancement: write the feature with a passing test; do not change behaviour the ticket did not ask for.
+- Enhancement: write the feature with a passing test; do not change behaviour that neither the ticket nor a
+  person's follow-up on it asked for.
+- Read every event in NEW EVENTS: several can arrive together, such as a merge notice and a new request.
+- While your pull request is open, a person's follow-up asking for more or different changes is part of your
+  ticket, even when it goes beyond the original task: implement it with a test, push_changes to the same pull
+  request, and update_ticket with a note saying what you added. Never open a second pull request.
+- Once your pull request is merged, your ticket is finished. A person's request that arrives after the merge,
+  or together with the merge notice, is new work: call redirect(trigger, kind, reason) for it. Do not
+  implement it yourself and do not tell anyone to file a ticket; redirect does that.
 - Keep changes small. Open one pull request from a branch named agent/<short-name>, with a body in three
   parts: Problem, Change, Verification.
 - Never run git checkout, git branch, git commit or git push yourself. Write the files, then call open_pr
@@ -248,6 +261,8 @@ def inject_view(t):
     out = [f"EVENT [{t['id']}] {t['source']} {t['actor']} thread={t['thread']}"
            + (f" kind={t['kind']}" if t.get("kind") else "") + (f" policy={t['policy']}" if t.get("policy") else ""),
            f'  "{head}"']
+    if t.get("redirected_from"):
+        out.append(f"REDIRECTED by {t['redirected_from']}: new work after its pull request merged. Start a new Worker.")
     tr = d["threads"].get(t["thread"], {}).get("triggers", [])
     near = [x for x in tr if x != t["id"]][-3:]
     if near:
@@ -261,6 +276,7 @@ def inject_view(t):
 def router_view():
     d = st.d
     lines = [f"[{w['id']}] \"{w['task'][:70]}\" kind={w.get('kind','')} status={w['status']} ticket={w.get('ticket_id','')} threads={w['threads']}"
+             + (" merged=yes" if w.get("merged") else "")
              for w in d["workers"].values()]
     return "OPEN AND PAST WORKERS\n" + ("\n".join(lines) or "none")
 
@@ -289,14 +305,15 @@ def _words(text):
     return set(_WORD.findall(text.lower()))
 
 
-def correlate(kind, actor, text):
+def correlate(kind, actor, text, exclude=None):
     """Code-only dedup: does an open ticket of the same kind already cover this? A heuristic, not a
-    guarantee — see docs/architecture.md. A match means pass-through, not a fresh model call."""
+    guarantee — see docs/architecture.md. A match means pass-through, not a fresh model call.
+    A merged Worker never matches: anything new after a merge is a new ticket."""
     d = st.d
     best = None
     words = _words(text)
     for w in d["workers"].values():
-        if w.get("kind") != kind or w["status"] != "running":
+        if w.get("kind") != kind or w["status"] != "running" or w.get("merged") or w["id"] == exclude:
             continue
         if now() - w.get("started", 0) > CORRELATE_WINDOW_S:
             continue
@@ -363,9 +380,16 @@ def intake(source, thread, actor, text, ext=None, kind=None, ticket_id=None, pol
             d["counts"]["code_drops"] += 1
             st.log("code", f"{actor} is not on the Telegram allowlist. No model called.", id=tid)
             return tid
-        if source == "github" and text.startswith("CI ") and not th["subscribers"]:
+        if source == "github" and (text.startswith("CI ") or re.fullmatch(r"pull request #\d+ merged", text)) \
+                and not th["subscribers"] and not any(w.get("pr", "").endswith(f"/pull/{thread[3:]}") for w in d["workers"].values()):
             t["disposition"] = "dropped"
             return tid
+        merged = re.fullmatch(r"pull request #(\d+) merged", text) if source == "github" else None
+        if merged:
+            # Done before the pass-through below, so the merge notice still reaches the Worker (it marks
+            # its ticket done) but a chat message right after it already takes the new-ticket path.
+            mark_merged(merged.group(1))
+        followups = []
         if th["subscribers"]:
             t["disposition"] = "passed"
             d["counts"]["passed_through"] += 1
@@ -380,12 +404,55 @@ def intake(source, thread, actor, text, ext=None, kind=None, ticket_id=None, pol
                     d["workers"][w]["status"] = "running"
                     st.log("router", f"{w}'s ticket resumes: a person followed up after it ended.", worker=w)
                 d["inbox"].setdefault(w, []).append(inject_view(t))
+                # A person's follow-up while the PR is open is part of the same ticket: record it on the
+                # board, whichever channel it came from, so the ticket shows everything that was asked.
+                wt = d["workers"].get(w, {})
+                # (A reply on the card itself is saved by the Bug UI already.)
+                if human and source != "bugui" and wt.get("ticket_id") and not wt.get("merged"):
+                    followups.append(wt["ticket_id"])
             st.log("pass", f"{th['subscribers'][0]} already follows this thread. No Router call.", id=tid, workers=th["subscribers"])
             st.save()
-            for w in th["subscribers"]:
-                wake_worker(w)
-            return tid
+            subscribers = list(th["subscribers"])
+        else:
+            subscribers = None
 
+    if subscribers is not None:
+        for ticket in dict.fromkeys(followups):
+            try:
+                bugui_update(ticket, comment=f"Follow-up from {actor} via {source}: {text[:300]}")
+            except Exception:
+                pass
+        for w in subscribers:
+            wake_worker(w)
+        return tid
+    return route_new(tid, kind=kind, ticket_id=ticket_id)
+
+
+def mark_merged(number):
+    """A Worker whose pull request merged has finished its ticket. It keeps its own PR Thread, but leaves
+    chat Threads — a Telegram chat (one Thread for every request in it) and its ticket's card on the board —
+    so the next request there is judged as new work instead of being passed straight to a finished Worker."""
+    with st.lock:
+        d = st.d
+        for w in d["workers"].values():
+            if w.get("merged") or not w.get("pr", "").endswith(f"/pull/{number}"):
+                continue
+            w["merged"] = True
+            for thread in [x for x in w["threads"] if x.startswith(("tg:", "bugui:"))]:
+                w["threads"].remove(thread)
+                subs = d["threads"].get(thread, {}).get("subscribers", [])
+                if w["id"] in subs:
+                    subs.remove(w["id"])
+            st.log("code", f"{w['id']}'s pull request #{number} merged. New requests in its chat get a new ticket.", worker=w["id"])
+
+
+def route_new(tid, kind=None, ticket_id=None, exclude=None):
+    """A Trigger nobody follows yet: classify, correlate, else create a ticket and queue it for the Router.
+    Also the path for a message a Worker redirected as new work (exclude= that Worker)."""
+    with st.lock:
+        t = st.d["triggers"][tid]
+        source, thread, actor, text = t["source"], t["thread"], t["actor"], t["text"]
+        th = st.d["threads"][thread]
     if kind is None:
         v = classify(source, actor, text)
         with st.lock:
@@ -401,7 +468,7 @@ def intake(source, thread, actor, text, ext=None, kind=None, ticket_id=None, pol
         with st.lock:
             t["kind"] = kind
 
-    match = correlate(kind, actor, text)
+    match = correlate(kind, actor, text, exclude=exclude)
     if match:
         with st.lock:
             d = st.d
@@ -420,7 +487,9 @@ def intake(source, thread, actor, text, ext=None, kind=None, ticket_id=None, pol
         wake_worker(match)
         return tid
 
-    if ticket_id is None and source != "bugui":
+    # A ticket filed on the board arrives with its ticket_id; anything else new needs one, including a
+    # reply on a merged ticket's card (source bugui, but new work).
+    if ticket_id is None:
         try:
             created = bugui_create(kind, title=text[:80], description=text, source=source, reporter=actor)
             ticket_id = created.get("id")
@@ -484,6 +553,8 @@ def do_start_worker(task, kind, ticket_id, threads_csv, policy):
         d = st.d
         wid = st.next("W")
         threads = [t for t in threads_csv.split(",") if t]
+        if ticket_id and f"bugui:{ticket_id}" not in threads:
+            threads.append(f"bugui:{ticket_id}")   # replies on the ticket's own card reach its Worker
         w = {"id": wid, "task": task, "kind": kind, "ticket_id": ticket_id, "threads": threads,
              "policy": policy, "status": "running", "started": now(), "reporter": ""}
         for th in threads:
@@ -535,6 +606,8 @@ def send_reply(thread, text):
             telegram("sendMessage", chat_id=thread.split(":", 1)[1], text=text)
         elif thread.startswith("gh:") and AGENT_GH_TOKEN:
             gh("POST", f"/repos/{AGENT_REPO}/issues/{thread[3:]}/comments", {"body": text})
+        elif thread.startswith("bugui:"):
+            bugui_update(thread.split(":", 1)[1], comment=f"Agent: {text}")
     except Exception as e:
         st.log("system", f"Sending the reply failed: {type(e).__name__}")
     return "sent"
@@ -710,6 +783,24 @@ def brain_call(op, **k):
                 th["subscribers"].append(k["wid"])
                 w.setdefault("threads", []).append(k["thread"])
             return None
+        if op == "redirect":
+            t = d["triggers"].get(k["trigger"])
+            if not t:
+                return f"unknown trigger {k['trigger']}"
+            if t.get("redirected_from"):
+                return "already redirected"
+            w = d["workers"][k["wid"]]
+            # Leave a shared chat Thread so the chat's next messages follow the new ticket; a PR Thread
+            # stays this Worker's own.
+            if not t["thread"].startswith("gh:"):
+                subs = d["threads"].get(t["thread"], {}).get("subscribers", [])
+                if k["wid"] in subs:
+                    subs.remove(k["wid"])
+                if t["thread"] in w["threads"]:
+                    w["threads"].remove(t["thread"])
+            t["redirected_from"] = k["wid"]
+            st.log("worker", f"{k['wid']} redirects {k['trigger']} as new work: {k['reason']}", worker=k["wid"], id=k["trigger"])
+            return "ok"
         if op == "report":
             w = d["workers"][k["wid"]]
             w["status"] = {"confirmed": "done", "not_confirmed": "discarded"}.get(k["status"], "running")
@@ -765,6 +856,17 @@ def build_worker_session(wid, ticket_id, repo, kind, policy):
         brain_call("subscribe", wid=wid, thread=args["thread"])
         return {"content": [{"type": "text", "text": "subscribed"}]}
 
+    @sdk.tool("redirect", "After your pull request has merged: hand a person's new request (a Trigger id) to a new "
+              "ticket and Worker. kind is bug or enhancement.", {"trigger": str, "kind": str, "reason": str})
+    async def redirect(args):
+        r = brain_call("redirect", wid=wid, trigger=args["trigger"], reason=args.get("reason", ""))
+        if r != "ok":
+            return {"content": [{"type": "text", "text": f"redirect failed: {r}"}], "is_error": True}
+        kind_ = args.get("kind") if args.get("kind") in ("bug", "enhancement") else None
+        # route_new may call the Filter model and the Bug UI; run it off this session's event loop.
+        threading.Thread(target=route_new, args=(args["trigger"],), kwargs={"kind": kind_, "exclude": wid}, daemon=True).start()
+        return {"content": [{"type": "text", "text": "redirected: it becomes a new ticket with its own Worker"}]}
+
     @sdk.tool("report", "Report to the Router.", {"status": str, "summary": str})
     async def report(args):
         brain_call("report", wid=wid, status=args["status"], summary=args["summary"])
@@ -777,9 +879,10 @@ def build_worker_session(wid, ticket_id, repo, kind, policy):
         permission_mode="bypassPermissions", max_turns=40, max_budget_usd=SPEND_CAP,
         hooks={"PreToolUse": [sdk.HookMatcher(matcher="Bash", hooks=[block_dangerous_bash])]},
         mcp_servers={"worker": sdk.create_sdk_mcp_server(
-            "worker", tools=[open_pr, push_changes, update_ticket, subscribe, report])},
+            "worker", tools=[open_pr, push_changes, update_ticket, subscribe, redirect, report])},
         allowed_tools=["Read", "Write", "Edit", "Bash", "mcp__worker__open_pr", "mcp__worker__push_changes",
-                       "mcp__worker__update_ticket", "mcp__worker__subscribe", "mcp__worker__report"])
+                       "mcp__worker__update_ticket", "mcp__worker__subscribe", "mcp__worker__redirect",
+                       "mcp__worker__report"])
     return options, done
 
 
@@ -863,6 +966,19 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "P
 
 @app.on_event("startup")
 def start():
+    # Workers started before do_start_worker added it don't follow their own card's Thread yet.
+    for wid, w in st.d["workers"].items():
+        tid_ = w.get("ticket_id")
+        if tid_ and f"bugui:{tid_}" not in w["threads"] and not w.get("merged"):
+            w["threads"].append(f"bugui:{tid_}")
+            subs = st.d["threads"].setdefault(f"bugui:{tid_}", {"id": f"bugui:{tid_}", "subscribers": [], "triggers": []})["subscribers"]
+            if wid not in subs:
+                subs.append(wid)
+    # Merges seen before mark_merged existed (or before a crash) still count: replay them from history.
+    for t in list(st.d["triggers"].values()):
+        m = re.fullmatch(r"pull request #(\d+) merged", t["text"]) if t["source"] == "github" else None
+        if m:
+            mark_merged(m.group(1))
     for f in (router_loop, telegram_loop, github_loop):
         threading.Thread(target=f, daemon=True).start()
     # A restart kills every in-progress round outright, with no clean shutdown — including one that
@@ -906,6 +1022,20 @@ async def webhook_bugui(req: Request, x_bugui_token: str = Header("")):
     b = await req.json()
     threading.Thread(target=intake, args=("bugui", f"bugui:{b['id']}", b.get("reporter", "someone"), b["description"]),
                      kwargs={"kind": b["type"], "ticket_id": b["id"], "ext": f"bugui{b['id']}"}, daemon=True).start()
+    return {"ok": True}
+
+
+@app.post("/webhooks/bugui/followup")
+async def webhook_bugui_followup(req: Request, x_bugui_token: str = Header("")):
+    """A person replied on a ticket's card. Its Thread is bugui:<id>: while the ticket's PR is open its Worker
+    follows that Thread and gets it; after the merge nobody does, so it is judged as new work like any chat
+    message. The Bug UI has already saved it as a comment on the card."""
+    auth(x_bugui_token, BUG_UI_TOKEN)
+    b = await req.json()
+    if not b.get("id") or not (b.get("text") or "").strip():
+        raise HTTPException(400)
+    threading.Thread(target=intake, args=("bugui", f"bugui:{b['id']}", b.get("reporter") or "someone", b["text"].strip()),
+                     daemon=True).start()
     return {"ok": True}
 
 

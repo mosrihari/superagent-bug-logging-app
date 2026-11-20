@@ -45,3 +45,15 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px; }
 .new-ticket button {
   background: var(--accent); color: white; border: none; padding: 10px; border-radius: 8px; font: inherit; cursor: pointer;
 }
+
+/* ticket follow-ups */
+.comments li.c-person { color: inherit; font-weight: 500; }
+.comments li.c-agent { color: #2563eb; }
+.followup-toggle, .followup button { margin-top: 8px; font: inherit; font-size: 0.8rem; padding: 4px 10px; border-radius: 6px; border: 1px solid #cbd5e1; background: #fff; cursor: pointer; }
+.followup button[type="submit"] { background: #2563eb; border-color: #2563eb; color: #fff; }
+.followup button:disabled { opacity: 0.6; }
+.followup { margin-top: 8px; }
+.followup textarea, .followup input { width: 100%; box-sizing: border-box; font: inherit; font-size: 0.85rem; padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 6px; }
+.followup-row { display: flex; gap: 6px; align-items: center; }
+.followup-row input { flex: 1; }
+.followup-row button { margin-top: 6px; }

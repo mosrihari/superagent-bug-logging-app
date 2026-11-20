@@ -1,5 +1,6 @@
 import { listTickets } from "@/lib/db"
 import AutoRefresh from "./AutoRefresh"
+import FollowUp from "./FollowUp"
 
 export const dynamic = "force-dynamic"
 
@@ -46,11 +47,19 @@ function Column({ title, tickets }: { title: string; tickets: ReturnType<typeof 
           {t.pr_url && <a className="pr-link" href={t.pr_url} target="_blank">View pull request →</a>}
           {t.comments.length > 0 && (
             <ul className="comments">
-              {t.comments.map((c, i) => <li key={i}>{c.text}</li>)}
+              {t.comments.map((c, i) => <li key={i} className={commentClass(c.text)}>{c.text}</li>)}
             </ul>
           )}
+          <FollowUp id={t.id} merged={t.status === "done"} />
         </article>
       ))}
     </section>
   )
+}
+
+// Who wrote a comment: a person's reply, the agent's reply in chat, or a Worker's progress note.
+function commentClass(text: string) {
+  if (text.startsWith("Follow-up from ")) return "c-person"
+  if (text.startsWith("Agent: ")) return "c-agent"
+  return "c-note"
 }

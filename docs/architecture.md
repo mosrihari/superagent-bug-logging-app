@@ -30,7 +30,7 @@ Three listeners, proven working end to end: **Bug UI**, **Telegram**, **GitHub**
 | Source | Mechanism | What it produces |
 |---|---|---|
 | Telegram | long-polling (`getUpdates`), same as the reference project | A raw message. The Filter classifies it: `bug`, `enhancement`, or `chat` (dropped). |
-| Bug UI | webhook (`POST /webhooks/bugui`) fired when a person files a ticket directly in the UI | An already-typed ticket (`bug` or `enhancement`) — no classification needed |
+| Bug UI | webhook (`POST /webhooks/bugui`) fired when a person files a ticket directly in the UI; `POST /webhooks/bugui/followup` when they reply on a card | An already-typed ticket (`bug` or `enhancement`), no classification needed. A reply is a follow-up on thread `bugui:<id>` (see "Follow-ups" below) |
 | GitHub | polling (`gh` REST API) for both conversation comments *and* inline review comments, plus CI and merge status | Either a pass-through to the Worker that owns the PR's thread (no Router call), or, if nothing owns it, a fresh candidate |
 
 **Why Bug UI is already typed, but Telegram isn't:** a person filing a ticket in the UI already tells you what kind of work it is. A Telegram message is just words — that's the one place the two-layer Filter (code rules, then a small model reading `FILTER_POLICY`) earns its keep.
@@ -61,6 +61,29 @@ Before creating a second ticket for the same problem, `intake()` runs a cheap, c
 ## What ends a Worker's turn
 
 Same rule as both reference projects: **a Worker never merges its own pull request.** It opens the PR, pushes updates when a reviewer comments, and updates the Bug UI ticket's status (`investigating → fix_opened → in_review → done`). A human merges. That's the one gate that doesn't move, no matter which Source started the Ticket.
+
+## Follow-ups: same ticket until the merge, new ticket after
+
+A person keeps talking after a Worker opens its PR: in Telegram, in PR comments, or with **Reply** on the
+ticket's card in the Bug UI (thread `bugui:<id>`; every Worker follows its own card). The rule is:
+
+- **While the PR is open**, any person's follow-up is part of that ticket, even if it goes beyond the original
+  ask. It passes straight to the same Worker (no Router call), is recorded on the card as
+  `Follow-up from <name> via <source>: …`, and the Worker pushes to the **same** PR. Never a second PR.
+- **Once the PR merges**, the ticket is finished. `mark_merged()` (code, not a model) takes the Worker off its
+  chat threads (`tg:` and `bugui:`) but leaves it on its own PR thread. A Telegram chat is one thread for every
+  request in it, so without this the chat's next request would go straight to a finished Worker; that is
+  the bug this section exists because of. The next request has no subscriber, so it goes through
+  `route_new()`: classify, correlate (a merged Worker never matches), new ticket, Router, new Worker. The
+  new Worker clones fresh from `main`, so it already has the merged code.
+- **The race**: a request can reach the old Worker in the same batch as its merge notice. The Worker's
+  `redirect(trigger, kind, reason)` tool covers that: it detaches the Worker from that chat and sends the
+  message through `route_new()`. The Router sees it marked `REDIRECTED` and starts a Worker without
+  asking the person whether they want a ticket.
+
+The Router's replies on a `bugui:` thread are posted on the card as `Agent: …`, so a person who asked on the
+board sees the answer there. `agent/test_routing.py` runs all of this offline (stubbed models and Bug UI):
+`venv/Scripts/python.exe test_routing.py` from `agent/`.
 
 ## What's stubbed, deliberately, in this reference build
 
