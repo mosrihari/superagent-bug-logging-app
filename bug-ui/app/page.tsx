@@ -1,4 +1,5 @@
 import { listTickets } from "@/lib/db"
+import AutoRefresh from "./AutoRefresh"
 
 export const dynamic = "force-dynamic"
 
@@ -18,6 +19,7 @@ export default function Board() {
   const enhancements = tickets.filter(t => t.type === "enhancement")
   return (
     <div className="board">
+      <AutoRefresh />
       <Column title="Bugs" tickets={bugs} />
       <Column title="Enhancements" tickets={enhancements} />
     </div>

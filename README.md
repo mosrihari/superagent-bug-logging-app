@@ -1,9 +1,10 @@
 # Superagent Bug Logging App
 
-A small, self-improving app: users report bugs or ask for features in Telegram or a ticket board,
-the product's own errors reach it through Axiom, and one always-on Router dispatches an ephemeral
-Worker per ticket, which fixes the bug or implements the feature and opens a pull request. A human
-only ever merges it.
+A small, self-improving app: users report bugs or ask for features in Telegram or a ticket board, and
+one always-on Router dispatches an ephemeral Worker per ticket, which fixes the bug or implements the
+feature and opens a pull request. A human only ever merges it. Three listeners, proven working end to
+end: **Bug UI**, **Telegram**, **GitHub** (PR comments and CI). Axiom was designed in and its webhook
+endpoint exists, but isn't live yet — see `docs/architecture.md`.
 
 Built from the same design as [`build-a-super-agent`](https://github.com/VizuaraAI/build-a-super-agent)
 (DeepSeek's *Exploring Super-agent Design*) and [`dsh-superagent-prototype`](https://github.com/deepseek-ai/dsh-superagent-prototype),
@@ -21,8 +22,16 @@ docs/         the architecture this implements
 
 ## Run it locally
 
-You need Python 3.11+, Node 18+, an [OpenRouter](https://openrouter.ai) key, and a GitHub account.
-Telegram and Axiom are both optional for a first run.
+You need Python 3.11+, Node 18+, a GitHub account, and a machine where you've already run
+`claude login` (Claude Code's own login) — the brain authenticates through that session and bills
+against your Claude subscription's monthly Agent SDK credit, no separate API key needed. Telegram is
+optional for a first run; try `drive.py` against the Bug UI and GitHub first.
+
+The Worker runs with `permission_mode="bypassPermissions"` — it edits files and runs shell commands
+without pausing for approval, the thing that makes it a Super Agent instead of a chat assistant. There
+is no container around it, only a short blocked-commands safety net (`block_dangerous_bash` in
+`agent/brain.py`). Keep `AGENT_REPO` a disposable repository you don't mind an autonomous agent pushing
+to, and watch the first several runs rather than leaving it unattended. See `docs/architecture.md`.
 
 **1. The demo app.** Push it to its own repository and turn on GitHub Actions.
 
@@ -50,13 +59,14 @@ npm run dev                  # http://localhost:3000
 
 ```bash
 cd agent
+python -m venv venv && venv/Scripts/activate   # or `source venv/bin/activate` on macOS/Linux
 pip install -r requirements.txt
-cp ../.env.example ../.env   # fill in OPENROUTER_API_KEY, AGENT_REPO, AGENT_GH_TOKEN, BUG_UI_TOKEN
+cp ../.env.example ../.env   # fill in AGENT_REPO, AGENT_GH_TOKEN, BUG_UI_TOKEN
 export $(grep -v '^#' ../.env | xargs)
 uvicorn brain:app --reload --port 8000
 ```
 
-**4. Try it without Telegram or Axiom first:**
+**4. Try it without Telegram first:**
 
 ```bash
 python agent/drive.py bug "Priya" "login fails after an idle session, shows a plain 401"
@@ -72,12 +82,12 @@ request on your `demo-app` repository. A human merges it; nothing here does that
 - **Telegram:** make a bot with [@BotFather](https://t.me/BotFather), set `TELEGRAM_TOKEN`. Leave
   `ALLOWED_TELEGRAM` empty to let anyone message it, or list usernames to restrict it — decide this
   deliberately, it's a real authorization choice, not a default to skip past.
-- **Axiom:** ship `demo-app`'s logs there (`AXIOM_TOKEN`/`AXIOM_DATASET` in its own `.env`), write a
-  saved query that aggregates errors (never raw log lines — see `docs/architecture.md`), and point its
-  alert's webhook action at `POST <your-brain-url>/webhooks/axiom` with header `x-axiom-token` matching
-  `AXIOM_WEBHOOK_TOKEN`.
-- **GitHub:** already wired — PR comments and CI results on `AGENT_REPO` reach the Worker that opened
-  the PR automatically, no extra setup.
+- **GitHub:** already wired — PR conversation comments, inline review comments, and CI results on
+  `AGENT_REPO` all reach the Worker that opened the PR automatically, no extra setup.
+- **Axiom (parked, not live):** the `/webhooks/axiom` endpoint exists and its body template is verified
+  against Axiom's real Custom Webhook Notifier variables (see `docs/architecture.md`), but actually
+  using it needs `demo-app` deployed somewhere receiving real traffic, and the brain reachable from the
+  public internet (not `localhost`) — neither is set up in this build.
 
 ## Deploying
 
@@ -95,8 +105,9 @@ request on your `demo-app` repository. A human merges it; nothing here does that
 Same caveats as the two projects it's built from:
 
 - **Security is not solved.** This listens to untrusted input (chat messages, log alerts) and lets a
-  model-driven Worker run shell commands against a real repository. Keep `AGENT_REPO` a throwaway repo,
-  scope its token to just that repo, and set a spending limit on your OpenRouter key.
+  model-driven Worker run shell commands against a real repository with no approval gate and no
+  container boundary — only the blocked-commands hook in `agent/brain.py`. Keep `AGENT_REPO` a throwaway
+  repo, scope its token to just that repo, and keep `SPEND_CAP` well under your monthly Agent SDK credit.
 - **State is a single JSON file** (`agent/state.json`), guarded by one lock — fine for one process,
   not for scaling the brain horizontally.
 - **Correlation across duplicate reports is a keyword-overlap heuristic**, not a guarantee. A Worker is

@@ -1,15 +1,15 @@
 /**
- * The ticket store. SQLite on local disk — fine for `next dev`, but Vercel's serverless filesystem
- * does not persist between invocations, so this file is a placeholder for local development only.
- * Before deploying to Vercel, swap this module for a real hosted database (Neon, Vercel Postgres,
- * or Vercel KV), keeping the same five functions so nothing else in the app has to change.
- * See README.md's "Deploying" section.
+ * The ticket store. SQLite on local disk, via Node's built-in node:sqlite (no native build step) —
+ * fine for `next dev`, but Vercel's serverless filesystem does not persist between invocations, so this
+ * file is a placeholder for local development only. Before deploying to Vercel, swap this module for a
+ * real hosted database (Neon, Vercel Postgres, or Vercel KV), keeping the same five functions so
+ * nothing else in the app has to change. See README.md's "Deploying" section.
  */
-import Database from "better-sqlite3"
+import { DatabaseSync } from "node:sqlite"
 import path from "path"
 
-const db = new Database(path.join(process.cwd(), "tickets.db"))
-db.pragma("journal_mode = WAL")
+const db = new DatabaseSync(path.join(process.cwd(), "tickets.db"))
+db.exec("PRAGMA journal_mode = WAL")
 db.exec(`
   CREATE TABLE IF NOT EXISTS tickets (
     id TEXT PRIMARY KEY,

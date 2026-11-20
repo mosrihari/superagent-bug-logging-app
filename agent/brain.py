@@ -1,16 +1,32 @@
 """The brain of a self-improving app: a Router, a Filter, Workers, and the state that ties them together.
 
+Runs on the Claude Agent SDK, authenticated through the same `claude login` session as Claude Code on
+this machine — so calls bill against your Claude subscription's monthly Agent SDK credit, not a separate
+per-token API key. All three roles default to Haiku 5.5 (claude-haiku-5-5), the cheapest model, since
+this is a prototype for testing. See README.md and docs/architecture.md.
+
+The SDK runs its own agent loop and tool execution internally (that's the whole point of it), so unlike
+a hand-rolled OpenAI-style chat-completions integration, this file never manually parses a tool_calls
+list or feeds results back in a loop — `ClaudeSDKClient` does that. The Worker also gets Claude Code's
+own Read/Write/Edit/Bash tools for free instead of us reimplementing file/shell access.
+
+The Worker runs with permission_mode="bypassPermissions" (no per-action approval prompt) so it can act
+without a human watching every step — that is what makes it a Super Agent and not a chat assistant. The
+one safety net kept on top of that is `block_dangerous_bash`, a PreToolUse hook that refuses a short list
+of command patterns (force-push, rm -rf near a root, piping a download into a shell, sudo, ...) before
+they run. It is a net, not a sandbox: there is no container boundary around the Worker's shell. Keep
+AGENT_REPO a throwaway repository and AGENT_GH_TOKEN scoped to just that repo. See docs/architecture.md.
+
 One always-on process. It listens to Telegram (people), the Bug UI (bugs and enhancements filed
 directly), Axiom (alerts on the product's own logs) and GitHub (pull request follow-ups). It decides
 what is worth doing, dispatches a Worker per piece of work, and never merges its own pull request.
 
 Run it anywhere that stays on: `uvicorn agent.brain:app --host 0.0.0.0 --port 8000`.
-See docs/architecture.md for the design this implements, and README.md for setup.
 
 State is one JSON file (`agent/state.json` by default), guarded by a lock. That is enough for one
-process; swap `State.save`/`State.__init__` for a real store (Redis, Postgres, Modal's Dict) before
-running more than one brain process or caring about concurrent writers.
+process; swap `State.save`/`State.__init__` for a real store before running more than one brain process.
 """
+import asyncio
 import json
 import os
 import re
@@ -18,24 +34,27 @@ import subprocess
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import claude_agent_sdk as sdk
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 # --------------------------------------------------------------------------------------- settings
-ROUTER_MODEL = os.environ.get("ROUTER_MODEL", "deepseek/deepseek-v4.1-flash")
-FILTER_MODEL = os.environ.get("FILTER_MODEL", "deepseek/deepseek-v4.1-flash")
-WORKER_MODEL = os.environ.get("WORKER_MODEL", "deepseek/deepseek-v4-pro")
-SPEND_CAP = float(os.environ.get("SPEND_CAP", "15.0"))
+# Haiku 5.5: the cheapest Claude model, for all three roles while this is a prototype. Bump WORKER_MODEL
+# to claude-sonnet-5-5 later if Haiku's fixes are too shallow for real bugs — see README.md.
+ROUTER_MODEL = os.environ.get("ROUTER_MODEL", "claude-haiku-5-5")
+FILTER_MODEL = os.environ.get("FILTER_MODEL", "claude-haiku-5-5")
+WORKER_MODEL = os.environ.get("WORKER_MODEL", "claude-haiku-5-5")
+# A global cumulative-spend cap, checked before every model call, PLUS passed as each session's own
+# max_budget_usd as a second, SDK-enforced backstop. Keep this well under your monthly Agent SDK credit.
+SPEND_CAP = float(os.environ.get("SPEND_CAP", "5.0"))
 CUT = 160        # characters of a trigger's text inlined before it is spilled behind a pointer
-OUT_CUT = 1500   # characters of a worker's tool output inlined before it is spilled
 CORRELATE_WINDOW_S = 48 * 3600   # how long an open ticket stays eligible for a correlation match
 CORRELATE_OVERLAP = 0.35         # minimum keyword-overlap ratio to call two reports the same problem
 
-AGENT_REPO = os.environ.get("AGENT_REPO", "")                 # "you/demo-app" on GitHub
+AGENT_REPO = os.environ.get("AGENT_REPO", "")                 # "you/demo-app" on GitHub — keep it a throwaway
 AGENT_GH_TOKEN = os.environ.get("AGENT_GH_TOKEN", "")
 GH_TEAM = set(filter(None, os.environ.get("GH_TEAM", "").split(",")))
 BUG_UI_URL = os.environ.get("BUG_UI_URL", "").rstrip("/")     # e.g. https://your-bug-ui.vercel.app
@@ -52,41 +71,31 @@ def now():
     return round(time.time(), 2)
 
 
-def llm(model, messages, tools=None, max_tokens=1200, think=True):
-    """One call through OpenRouter. Returns (message, cost, usage)."""
-    body = {"model": model, "messages": messages, "max_tokens": max_tokens, "usage": {"include": True}}
-    if not think:
-        body["reasoning"] = {"enabled": False}
-    if tools:
-        body["tools"] = tools
-    for attempt in range(4):
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/chat/completions", data=json.dumps(body).encode(),
-            headers={"Authorization": "Bearer " + os.environ["OPENROUTER_API_KEY"],
-                     "Content-Type": "application/json", "X-Title": "Superagent bug logging app"})
-        try:
-            with urllib.request.urlopen(req, timeout=180) as r:
-                d = json.load(r)
-            if "choices" in d:
-                return d["choices"][0]["message"], float((d.get("usage") or {}).get("cost") or 0), d.get("usage") or {}
-            time.sleep(2 * (attempt + 1))
-        except (urllib.error.URLError, OSError, ValueError):
-            time.sleep(2 * (attempt + 1))
-    raise RuntimeError("model call failed")
+# ------------------------------------------------------------------------------- Worker safety net
+# Not a sandbox — there is no container boundary around the Worker's shell. This only refuses a short
+# list of command *patterns* before they run. See the module docstring and docs/architecture.md.
+BLOCKED_BASH_PATTERNS = [re.compile(p, re.I) for p in [
+    r"\brm\s+-rf\s+(/|~|\.\.)",            # delete from a root, home, or parent directory
+    r"\bgit\s+push\b.*(--force|-f\b)",     # force-push
+    r"\bgit\s+reset\s+--hard\s+origin",    # discard local history against upstream
+    r"\bsudo\b",                            # privilege escalation
+    r"\b(shutdown|reboot)\b",
+    r"(curl|wget)[^|]*\|\s*(sh|bash)\b",   # pipe a download straight into a shell
+    r"\.ssh/",                              # SSH keys/config
+    r"\bchmod\s+777\s+/",
+]]
 
 
-def tool(name, desc, **props):
-    req = [k for k, v in props.items() if not v.get("optional")]
-    clean = {k: {x: y for x, y in v.items() if x != "optional"} for k, v in props.items()}
-    return {"type": "function", "function": {"name": name, "description": desc,
-                                             "parameters": {"type": "object", "properties": clean, "required": req}}}
-
-
-S = {"type": "string"}
-
-
-def opt(**k):
-    return {"type": "string", "optional": True, **k}
+async def block_dangerous_bash(input_data, tool_use_id, context):
+    """A PreToolUse hook: refuses a Bash call matching a blocked pattern before it runs."""
+    if input_data.get("tool_name") == "Bash":
+        command = input_data.get("tool_input", {}).get("command", "")
+        for pattern in BLOCKED_BASH_PATTERNS:
+            if pattern.search(command):
+                st.log("system", f"Blocked a Worker command matching a safety rule: {command[:160]}")
+                return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                        "permissionDecisionReason": f"Blocked by this prototype's safety net (matches {pattern.pattern!r}). Try a narrower, more specific command."}}
+    return {}
 
 
 # ------------------------------------------------------------------------------------------ prompts
@@ -94,9 +103,9 @@ FILTER_POLICY = """You judge one message from a product's users or team for an a
 Classify it into exactly one of:
 - "bug": a report that something is broken, wrong, slow or confusing in the product.
 - "enhancement": a request for new or changed behaviour the product does not have yet.
-- "chat": anything else (greetings, thanks, unrelated talk, a question already answered in your reply history).
+- "chat": anything else (greetings, thanks, unrelated talk).
 A bug or enhancement needs no explicit request; a plain report is worth acting on even when nobody asks.
-Answer only JSON: {"kind": "bug" | "enhancement" | "chat", "reason": "at most 8 words"}."""
+Answer only JSON on one line: {"kind": "bug" | "enhancement" | "chat", "reason": "at most 8 words"}."""
 
 ROUTER_SYSTEM = """You are the Router of a Super Agent that keeps one small product's bugs fixed and its
 feature requests implemented. You are one long-lived session and its single voice to the team and to users.
@@ -109,27 +118,24 @@ Rules:
   that already has one; the event text will say so when a code-level correlation match already found it.
 - A different problem is a new ticket and gets its own Worker, even when it touches the same files or comes
   while another Worker is busy.
-- A bug ticket from Axiom (an alert, not a person) gets policy "silent": start its Worker and say nothing in
-  chat until it reports confirmed.
+- An event showing policy=silent in its EVENT line (an Axiom alert, not a person) gets policy "silent" on
+  start_worker: start its Worker and say nothing in chat until it reports confirmed.
 - A bug or enhancement reported directly by a person in Telegram: reply at once in one short line saying you
   are on it, then start the Worker.
 - When a Worker reports: if status is not_confirmed, say nothing. Otherwise write the reply yourself, in the
   channel the ticket came from (use reply with the ticket's own thread id).
 - Chat replies: under 100 words, conclusions only, ask only what needs a decision. Never paste logs.
-- Older work is spilled out of your window. To recall it, follow IDs with read(id); each result names the
-  next IDs. Do not guess.
-- Say each thing once. If a Worker's report adds nothing new for people, call done() without replying.
-- When there is nothing to do, call done()."""
+- Long texts are cut short with a pointer; call read(id) to see the rest. Do not guess at what was cut.
+- Say each thing once. If a Worker's report adds nothing new for people, say nothing and end your turn.
+- When there is nothing to do, end your turn without calling a tool."""
 
 WORKER_SYSTEM = """You are a Worker of a Super Agent. You have one ticket, your own context, and a clone of
-the product's repository at /work/repo. You never talk to people; you report to the Router, and the Router
-replies for you. Your ticket's kind is either "bug" (reproduce, then fix) or "enhancement" (implement, with
-tests).
-Tools: list_files, read_file, write_file, start (runs a command in the background and returns at once), stop,
-wait (until a background command finishes or a new event arrives), read (fetch a spilled item by id), open_pr,
-push_changes, subscribe, update_ticket (tell the Bug UI your ticket's current status), report.
+the product's repository in your working directory. You never talk to people; you report to the Router, and
+the Router replies for you. Your ticket's kind is either "bug" (reproduce, then fix) or "enhancement"
+(implement, with tests).
+You have Claude Code's own Read, Write, Edit and Bash tools for the repository itself. Beyond those, you
+have: open_pr, push_changes, update_ticket (tell the Bug UI your ticket's current status), subscribe, report.
 Rules:
-- Long commands never block you. New events can arrive while a command runs; handle them as soon as they do.
 - Bug: reproduce with a real failing test before changing code. Tests: python -m pytest -q
 - Enhancement: write the feature with a passing test; do not change behaviour the ticket did not ask for.
 - Keep changes small. Open one pull request from a branch named agent/<short-name>, with a body in three
@@ -140,38 +146,10 @@ Rules:
   "enhancement_opened") once you have a pull request, "done" only after it reports merged to you.
 - On policy "silent": if you cannot confirm the problem with evidence, call update_ticket("not_confirmed", ...)
   and report not_confirmed. Do not change anything you cannot justify with evidence.
-- If a Splunk/Axiom error does not plausibly explain the reported symptom, say so in your report instead of
-  guessing; ask the Router a question if you need one fact from the reporter before you can proceed.
-- When your pull request is merged, call update_ticket("done", ...) once, then call wait.
-- Report a final result once. After that, a passing CI run or other good news needs no new report: call wait.
-- Finish with report(status, summary). Status is confirmed, not_confirmed, progress, or question. Summary: at
-  most 60 words, facts only."""
-
-ROUTER_TOOLS = [
-    tool("start_worker", "Start one Worker for one ticket.", task=S, kind={"type": "string", "enum": ["bug", "enhancement"]},
-         ticket_id=S, threads={"type": "array", "items": S}, policy={"type": "string", "enum": ["normal", "silent"]}),
-    tool("reply", "Say something to people, in the channel of a Thread id.", thread=S, text=S),
-    tool("attach", "Route a Trigger to the Worker that owns its ticket.", trigger=S, worker=S),
-    tool("message_worker", "Send a Worker an instruction.", worker=S, text=S),
-    tool("read", "Recall an object by id: a Trigger, a Thread or a Worker. The result names the next ids.", id=S),
-    tool("done", "Nothing more to do this turn."),
-]
-WORKER_TOOLS = [
-    tool("list_files", "List the repository's files."),
-    tool("read_file", "Read a file.", path=S),
-    tool("write_file", "Replace a file's contents.", path=S, content=S),
-    tool("start", "Start a command in the background. Returns a job id at once.", command=S),
-    tool("stop", "Stop a background job.", job=S),
-    tool("wait", "Wait until a background job finishes or a new event arrives."),
-    tool("read", "Read a spilled item by id.", id=S),
-    tool("open_pr", "Commit all changes, push and open a pull request.", branch=S, title=S, body=S),
-    tool("push_changes", "Commit all changes and push them to the branch of your open pull request.", message=S),
-    tool("subscribe", "Follow another Thread: its new events reach you directly.", thread=S),
-    tool("update_ticket", "Tell the Bug UI this ticket's current status.",
-         status={"type": "string", "enum": ["investigating", "fix_opened", "enhancement_opened", "in_review", "done", "not_confirmed"]},
-         note=S),
-    tool("report", "Report to the Router.", status={"type": "string", "enum": ["confirmed", "not_confirmed", "progress", "question"]}, summary=S),
-]
+- If a reported error does not plausibly explain the symptom, say so in your report instead of guessing.
+- When your pull request is merged, call update_ticket("done", ...) once, then report confirmed and stop.
+- Report a final result once via report(status, summary). Status is confirmed, not_confirmed, progress, or
+  question. Summary: at most 60 words, facts only."""
 
 
 # -------------------------------------------------------------------------------------------- state
@@ -180,12 +158,12 @@ class State:
 
     def __init__(self):
         self.lock = threading.RLock()
-        self.d = {"triggers": {}, "threads": {}, "workers": {}, "router": [], "queue": [], "feed": [],
-                  "inbox": {}, "spill": {}, "log": [], "device": {}, "n": {"T": 0, "W": 0, "S": 0},
+        self.d = {"triggers": {}, "threads": {}, "workers": {}, "queue": [], "inbox": {}, "spill": {},
+                  "log": [], "n": {"T": 0, "W": 0, "S": 0},
                   "counts": {"events": 0, "code_drops": 0, "model_judged": 0, "model_drops": 0,
                              "passed_through": 0, "correlated": 0, "router_calls": 0, "router_decisions": 0,
-                             "replies": 0, "spend": 0.0, "tokens": 0, "worker_calls": 0, "restarts": 0},
-                  "cursor": {"tg": 0, "gh": ""}, "seen": {}, "started": now()}
+                             "replies": 0, "spend": 0.0, "worker_calls": 0, "restarts": 0},
+                  "cursor": {"tg": 0}, "seen": {}, "started": now()}
         if STATE_PATH.exists():
             self.d = json.loads(STATE_PATH.read_text())
             self.d["counts"]["restarts"] += 1
@@ -210,6 +188,15 @@ class State:
         self.d["spill"][sid] = text
         return sid
 
+    def spend(self, cost):
+        """Adds a Claude call's real cost (ResultMessage.total_cost_usd) to the running total."""
+        with self.lock:
+            self.d["counts"]["spend"] += cost or 0.0
+            self.save()
+
+    def over_budget(self):
+        return self.d["counts"]["spend"] > SPEND_CAP
+
 
 st = State()
 
@@ -228,7 +215,6 @@ def bugui(method, path, body=None):
 
 
 def bugui_create(kind, title, description, source, reporter):
-    """Creates the one ticket a bug or enhancement is filed under, regardless of which Source reported it."""
     return bugui("POST", "/api/tickets", {"type": kind, "title": title, "description": description,
                                           "source": source, "reporter": reporter, "fromBrain": True})
 
@@ -255,11 +241,12 @@ def one_line(t):
 
 
 def inject_view(t):
-    """Inline and Spill: the event's id and head, what is near it, and pointers to the rest."""
+    """Inline and Spill: the event's id and head, what is near it, and a pointer to the rest."""
     d = st.d
     text = t["text"]
     head = text if len(text) <= CUT else text[:CUT] + f"... [cut: rest -> read({t['id']})]"
-    out = [f"EVENT [{t['id']}] {t['source']} {t['actor']} thread={t['thread']}" + (f" kind={t['kind']}" if t.get("kind") else ""),
+    out = [f"EVENT [{t['id']}] {t['source']} {t['actor']} thread={t['thread']}"
+           + (f" kind={t['kind']}" if t.get("kind") else "") + (f" policy={t['policy']}" if t.get("policy") else ""),
            f'  "{head}"']
     tr = d["threads"].get(t["thread"], {}).get("triggers", [])
     near = [x for x in tr if x != t["id"]][-3:]
@@ -275,10 +262,7 @@ def router_view():
     d = st.d
     lines = [f"[{w['id']}] \"{w['task'][:70]}\" kind={w.get('kind','')} status={w['status']} ticket={w.get('ticket_id','')} threads={w['threads']}"
              for w in d["workers"].values()]
-    feed = d["feed"][-8:]
-    d["feed"] = []
-    return "OPEN AND PAST WORKERS\n" + ("\n".join(lines) or "none") + \
-        ("\nPASSED THROUGH SINCE LAST TURN (no decision needed)\n" + "\n".join(feed) if feed else "")
+    return "OPEN AND PAST WORKERS\n" + ("\n".join(lines) or "none")
 
 
 def router_read(i):
@@ -307,7 +291,7 @@ def _words(text):
 
 def correlate(kind, actor, text):
     """Code-only dedup: does an open ticket of the same kind already cover this? A heuristic, not a
-    guarantee — see docs/architecture.md. A match means pass-through, not a fresh Eval."""
+    guarantee — see docs/architecture.md. A match means pass-through, not a fresh model call."""
     d = st.d
     best = None
     words = _words(text)
@@ -324,6 +308,32 @@ def correlate(kind, actor, text):
     return best[0] if best else None
 
 
+# ------------------------------------------------------------------------------------- Claude Filter
+async def classify_async(source, actor, text):
+    """One stateless Haiku call: bug, enhancement, or chat. Billed against the subscription's Agent SDK
+    credit, via the same `claude login` session as Claude Code on this machine."""
+    options = sdk.ClaudeAgentOptions(model=FILTER_MODEL, system_prompt=FILTER_POLICY, allowed_tools=[],
+                                     permission_mode="bypassPermissions", max_turns=1, max_budget_usd=0.02)
+    content, cost = "", 0.0
+    async for msg in sdk.query(prompt=f"{source} {actor}: {text}", options=options):
+        if isinstance(msg, sdk.AssistantMessage):
+            content += "".join(b.text for b in msg.content if isinstance(b, sdk.TextBlock))
+        if isinstance(msg, sdk.ResultMessage):
+            cost = msg.total_cost_usd or 0.0
+    return content, cost
+
+
+def classify(source, actor, text):
+    try:
+        content, cost = asyncio.run(classify_async(source, actor, text))
+        st.spend(cost)
+        m = re.search(r"\{.*\}", content, re.S)
+        return json.loads(m.group(0)) if m else {"kind": "chat", "reason": "unclear"}
+    except Exception as e:
+        st.log("system", f"Filter call failed: {type(e).__name__}")
+        return {"kind": "chat", "reason": "filter unavailable"}
+
+
 # ------------------------------------------------------------------------------------------ intake
 def intake(source, thread, actor, text, ext=None, kind=None, ticket_id=None, policy=None):
     """Filter, correlate, then route. Code decides what code can decide."""
@@ -335,7 +345,8 @@ def intake(source, thread, actor, text, ext=None, kind=None, ticket_id=None, pol
             d["seen"][ext] = 1
         tid = st.next("T")
         t = {"id": tid, "source": source, "thread": thread, "actor": actor, "text": text, "t": now(),
-             "disposition": "", **({"kind": kind} if kind else {}), **({"ticket_id": ticket_id} if ticket_id else {})}
+             "disposition": "", **({"kind": kind} if kind else {}), **({"ticket_id": ticket_id} if ticket_id else {}),
+             **({"policy": policy} if policy else {})}
         d["triggers"][tid] = t
         th = d["threads"].setdefault(thread, {"id": thread, "subscribers": [], "triggers": []})
         th["triggers"].append(tid)
@@ -358,27 +369,29 @@ def intake(source, thread, actor, text, ext=None, kind=None, ticket_id=None, pol
         if th["subscribers"]:
             t["disposition"] = "passed"
             d["counts"]["passed_through"] += 1
+            human = source in ("telegram", "bugui") or (source == "github" and actor in GH_TEAM)
             for w in th["subscribers"]:
+                # A person's message on an ended Ticket's own Thread resumes it — same Mandate, no new
+                # Eval, matching the reference design's rule that bots and CI do not wake ended Tickets
+                # but a person's follow-up does. Without this, a message to a Worker that already
+                # reported confirmed/not_confirmed just sits in its inbox forever: wake_worker refuses
+                # anything whose status isn't "running".
+                if human and d["workers"].get(w, {}).get("status") != "running":
+                    d["workers"][w]["status"] = "running"
+                    st.log("router", f"{w}'s ticket resumes: a person followed up after it ended.", worker=w)
                 d["inbox"].setdefault(w, []).append(inject_view(t))
             st.log("pass", f"{th['subscribers'][0]} already follows this thread. No Router call.", id=tid, workers=th["subscribers"])
             st.save()
+            for w in th["subscribers"]:
+                wake_worker(w)
             return tid
 
-    # already typed (Bug UI, Axiom) skips the slow path; a raw Telegram message needs classifying
     if kind is None:
-        try:
-            msg, cost, use = llm(FILTER_MODEL, [{"role": "system", "content": FILTER_POLICY},
-                                                {"role": "user", "content": f"{source} {actor}: {text}"}], max_tokens=120, think=False)
-            m = re.search(r"\{.*\}", msg.get("content") or "", re.S)
-            v = json.loads(m.group(0)) if m else {"kind": "chat", "reason": "unclear"}
-        except Exception:
-            v, cost, use = {"kind": "chat", "reason": "filter unavailable"}, 0, {}
+        v = classify(source, actor, text)
         with st.lock:
             d = st.d
             d["counts"]["model_judged"] += 1
-            d["counts"]["spend"] += cost
-            d["counts"]["tokens"] += use.get("total_tokens", 0)
-        if v["kind"] == "chat":
+        if v.get("kind") == "chat":
             with st.lock:
                 t["disposition"] = "dropped"
                 st.d["counts"]["model_drops"] += 1
@@ -397,9 +410,14 @@ def intake(source, thread, actor, text, ext=None, kind=None, ticket_id=None, pol
             d["inbox"].setdefault(match, []).append(inject_view(t))
             d["counts"]["correlated"] += 1
             t["disposition"] = "correlated"
+            worker_ticket = d["workers"][match].get("ticket_id")
         st.log("code", f"Same {kind} as {match}'s ticket (keyword/reporter match). No new ticket, no Router call.", id=tid, worker=match)
-        if ticket_id is None:
-            bugui_update(d["workers"][match].get("ticket_id"), comment=f"Another report of the same issue: {text[:200]}")
+        if ticket_id is None and worker_ticket:
+            try:
+                bugui_update(worker_ticket, comment=f"Another report of the same issue: {text[:200]}")
+            except Exception:
+                pass
+        wake_worker(match)
         return tid
 
     if ticket_id is None and source != "bugui":
@@ -418,54 +436,91 @@ def intake(source, thread, actor, text, ext=None, kind=None, ticket_id=None, pol
     return tid
 
 
-# ---------------------------------------------------------------------------------------- router
-def router_tool(name, a):
-    d = st.d
-    if name == "start_worker":
-        with st.lock:
-            wid = st.next("W")
-            w = {"id": wid, "task": a.get("task", ""), "kind": a.get("kind", "bug"), "ticket_id": a.get("ticket_id", ""),
-                 "threads": a.get("threads", []), "policy": a.get("policy", "normal"), "status": "running",
-                 "started": now(), "reporter": ""}
-            for th in w["threads"]:
-                tr = d["threads"].get(th, {}).get("triggers", [])
-                if tr:
-                    w["reporter"] = d["triggers"][tr[-1]]["actor"]
-            d["workers"][wid] = w
-            for th in w["threads"]:
-                d["threads"].setdefault(th, {"id": th, "subscribers": [], "triggers": []})["subscribers"].append(wid)
-            d["inbox"][wid] = []
-            d["counts"]["router_decisions"] += 1
-            st.log("router", f"Router starts {wid} ({w['kind']}, policy {w['policy']}): {w['task'][:120]}", worker=wid)
-        context = "\n\n".join(inject_view(d["triggers"][d["threads"][th]["triggers"][-1]]) for th in w["threads"] if d["threads"].get(th, {}).get("triggers"))
-        if w["ticket_id"]:
-            try:
-                bugui_update(w["ticket_id"], status="investigating")
-            except Exception:
-                pass
-        threading.Thread(target=run_worker, args=(wid, w["task"], w["kind"], w["policy"], w["ticket_id"], context), daemon=True).start()
-        return f"started {wid}"
-    if name == "reply":
-        return send_reply(a.get("thread", ""), a.get("text", ""))
-    if name == "attach":
-        with st.lock:
-            t, wid = d["triggers"].get(a.get("trigger")), a.get("worker")
-            if not t or wid not in d["workers"]:
-                return "unknown trigger or worker"
-            th = d["threads"][t["thread"]]
-            if wid not in th["subscribers"]:
-                th["subscribers"].append(wid)
-                d["workers"][wid]["threads"].append(t["thread"])
-            d["inbox"].setdefault(wid, []).append(inject_view(t))
-            st.log("router", f"Router attaches {t['id']} to {wid}.", worker=wid)
-        return "attached"
-    if name == "message_worker":
-        with st.lock:
-            d["inbox"].setdefault(a.get("worker"), []).append("FROM ROUTER: " + a.get("text", ""))
-        return "sent"
-    if name == "read":
-        return router_read(a.get("id", ""))
-    return "ok"
+# ---------------------------------------------------------------------------- Router: business logic
+# A Worker's session does not stay connected forever waiting for follow-ups — it does one round (the
+# initial task, or a later batch of new inbox events) and disconnects. _busy_workers tracks which
+# Worker ids currently have a round in progress, so wake_worker() below can start a fresh round when
+# something new arrives for an idle one, instead of only reacting within a fixed window after it
+# started. Without this, a PR comment arriving after a Worker's first round ended would sit in its
+# inbox forever with nothing left running to read it — see docs/architecture.md.
+_busy_workers = set()
+_busy_lock = threading.Lock()
+
+
+def _mark_busy(wid):
+    with _busy_lock:
+        if wid in _busy_workers:
+            return False
+        _busy_workers.add(wid)
+        return True
+
+
+def _mark_free(wid):
+    with _busy_lock:
+        _busy_workers.discard(wid)
+
+
+def wake_worker(wid):
+    """Starts a new round for wid if one is not already running. Safe to call every time something is
+    appended to a Worker's inbox, including while it is already busy (a no-op then; its current round
+    will pick up the new item when it next checks)."""
+    w = st.d["workers"].get(wid)
+    if not w or w.get("status") != "running":
+        return
+    if not _mark_busy(wid):
+        return
+    threading.Thread(target=_run_resume_round, args=(wid,), daemon=True).start()
+
+
+def _run_resume_round(wid):
+    try:
+        asyncio.run(run_worker_round_async(wid))
+    finally:
+        _mark_free(wid)
+
+
+def do_start_worker(task, kind, ticket_id, threads_csv, policy):
+    with st.lock:
+        d = st.d
+        wid = st.next("W")
+        threads = [t for t in threads_csv.split(",") if t]
+        w = {"id": wid, "task": task, "kind": kind, "ticket_id": ticket_id, "threads": threads,
+             "policy": policy, "status": "running", "started": now(), "reporter": ""}
+        for th in threads:
+            tr = d["threads"].get(th, {}).get("triggers", [])
+            if tr:
+                w["reporter"] = d["triggers"][tr[-1]]["actor"]
+        d["workers"][wid] = w
+        for th in threads:
+            d["threads"].setdefault(th, {"id": th, "subscribers": [], "triggers": []})["subscribers"].append(wid)
+        d["inbox"][wid] = []
+        d["counts"]["router_decisions"] += 1
+        st.log("router", f"Router starts {wid} ({kind}, policy {policy}): {task[:120]}", worker=wid)
+    context = "\n\n".join(inject_view(d["triggers"][d["threads"][th]["triggers"][-1]]) for th in threads if d["threads"].get(th, {}).get("triggers"))
+    if ticket_id:
+        try:
+            bugui_update(ticket_id, status="investigating")
+        except Exception:
+            pass
+    _mark_busy(wid)
+    threading.Thread(target=run_worker, args=(wid, task, kind, policy, ticket_id, context), daemon=True).start()
+    return f"started {wid}"
+
+
+def do_attach(trigger_id, worker_id):
+    with st.lock:
+        d = st.d
+        t = d["triggers"].get(trigger_id)
+        if not t or worker_id not in d["workers"]:
+            return "unknown trigger or worker"
+        th = d["threads"][t["thread"]]
+        if worker_id not in th["subscribers"]:
+            th["subscribers"].append(worker_id)
+            d["workers"][worker_id]["threads"].append(t["thread"])
+        d["inbox"].setdefault(worker_id, []).append(inject_view(t))
+        st.log("router", f"Router attaches {trigger_id} to {worker_id}.", worker=worker_id)
+    wake_worker(worker_id)
+    return "attached"
 
 
 def send_reply(thread, text):
@@ -477,8 +532,7 @@ def send_reply(thread, text):
         st.log("reply", f"Router replies on {thread}: \"{text}\"", thread=thread)
     try:
         if thread.startswith("tg:") and TELEGRAM_TOKEN:
-            chat_id = thread.split(":", 1)[1]
-            telegram("sendMessage", chat_id=chat_id, text=text)
+            telegram("sendMessage", chat_id=thread.split(":", 1)[1], text=text)
         elif thread.startswith("gh:") and AGENT_GH_TOKEN:
             gh("POST", f"/repos/{AGENT_REPO}/issues/{thread[3:]}/comments", {"body": text})
     except Exception as e:
@@ -486,52 +540,76 @@ def send_reply(thread, text):
     return "sent"
 
 
-def router_loop():
-    while True:
-        time.sleep(0.5)
-        d = st.d
-        with st.lock:
-            batch = d["queue"][:]
-            d["queue"] = []
+# ---------------------------------------------------------------------- Router: Claude Agent SDK tools
+@sdk.tool("start_worker", "Start one Worker for one ticket.",
+          {"task": str, "kind": str, "ticket_id": str, "threads": "comma-separated Thread ids", "policy": str})
+async def tool_start_worker(args):
+    text = do_start_worker(args.get("task", ""), args.get("kind", "bug"), args.get("ticket_id", ""),
+                           args.get("threads", ""), args.get("policy", "normal"))
+    return {"content": [{"type": "text", "text": text}]}
+
+
+@sdk.tool("reply", "Say something to people, in the channel of a Thread id.", {"thread": str, "text": str})
+async def tool_reply(args):
+    return {"content": [{"type": "text", "text": send_reply(args["thread"], args["text"])}]}
+
+
+@sdk.tool("attach", "Route a Trigger to the Worker that owns its ticket.", {"trigger": str, "worker": str})
+async def tool_attach(args):
+    return {"content": [{"type": "text", "text": do_attach(args["trigger"], args["worker"])}]}
+
+
+@sdk.tool("message_worker", "Send a Worker an instruction.", {"worker": str, "text": str})
+async def tool_message_worker(args):
+    with st.lock:
+        st.d["inbox"].setdefault(args["worker"], []).append("FROM ROUTER: " + args["text"])
+    wake_worker(args["worker"])
+    return {"content": [{"type": "text", "text": "sent"}]}
+
+
+@sdk.tool("read", "Recall an object by id: a Trigger, a Thread or a Worker. The result names the next ids.", {"id": str})
+async def tool_read(args):
+    return {"content": [{"type": "text", "text": router_read(args["id"])}]}
+
+
+ROUTER_ALLOWED = ["mcp__router__start_worker", "mcp__router__reply", "mcp__router__attach",
+                  "mcp__router__message_worker", "mcp__router__read"]
+
+
+# --------------------------------------------------------------------------------------- Router loop
+async def router_loop_async():
+    options = sdk.ClaudeAgentOptions(
+        model=ROUTER_MODEL, system_prompt=ROUTER_SYSTEM, permission_mode="bypassPermissions",
+        mcp_servers={"router": sdk.create_sdk_mcp_server(
+            "router", tools=[tool_start_worker, tool_reply, tool_attach, tool_message_worker, tool_read])},
+        allowed_tools=ROUTER_ALLOWED, max_turns=6, max_budget_usd=SPEND_CAP)
+    async with sdk.ClaudeSDKClient(options=options) as client:
+        while True:
+            await asyncio.sleep(0.5)
+            with st.lock:
+                batch = st.d["queue"][:]
+                st.d["queue"] = []
             if not batch:
                 continue
-            events = [x if x.startswith("REPORT") else inject_view(d["triggers"][x]) for x in batch]
-            if d["counts"]["spend"] > SPEND_CAP:
-                st.log("system", "Spend cap reached. The Router will not call the model.")
+            if st.over_budget():
+                st.log("system", f"Spend cap (${SPEND_CAP}) reached. The Router will not call the model.")
                 continue
-            d["router"].append({"role": "user", "content": router_view() + "\n\nNEW\n" + "\n\n".join(events)})
-        for _ in range(6):
+            events = [x if x.startswith("REPORT") else inject_view(st.d["triggers"][x]) for x in batch]
+            prompt = router_view() + "\n\nNEW\n" + "\n\n".join(events)
             try:
-                msg, cost, use = llm(ROUTER_MODEL, [{"role": "system", "content": ROUTER_SYSTEM}] + d["router"][-24:], ROUTER_TOOLS, 700, think=False)
-            except Exception:
-                st.log("system", "A Router model call failed. It will retry on the next event.")
-                break
-            with st.lock:
-                d["counts"]["router_calls"] += 1
-                d["counts"]["spend"] += cost
-                d["counts"]["tokens"] += use.get("total_tokens", 0)
-                m = {"role": "assistant", "content": msg.get("content") or ""}
-                if msg.get("tool_calls"):
-                    m["tool_calls"] = msg["tool_calls"]
-                d["router"].append(m)
-            calls = msg.get("tool_calls") or []
-            if not calls:
-                break
-            finished = False
-            for c in calls:
-                fn = c["function"]["name"]
-                try:
-                    args = json.loads(c["function"]["arguments"] or "{}")
-                except ValueError:
-                    args = {}
-                res = router_tool(fn, args)
-                with st.lock:
-                    d["router"].append({"role": "tool", "tool_call_id": c["id"], "content": str(res)})
-                finished = finished or fn == "done"
-            with st.lock:
-                st.save()
-            if finished:
-                break
+                await client.query(prompt)
+                async for msg in client.receive_response():
+                    if isinstance(msg, sdk.ResultMessage):
+                        st.spend(msg.total_cost_usd)
+                        with st.lock:
+                            st.d["counts"]["router_calls"] += 1
+                            st.save()
+            except Exception as e:
+                st.log("system", f"A Router model call failed: {type(e).__name__}. It will retry on the next event.")
+
+
+def router_loop():
+    asyncio.run(router_loop_async())
 
 
 # --------------------------------------------------------------------------------------- Telegram
@@ -549,14 +627,18 @@ def telegram_loop():
         try:
             r = telegram("getUpdates", offset=st.d["cursor"]["tg"] + 1, timeout=25)
             for u in r.get("result", []):
-                st.d["cursor"]["tg"] = u["update_id"]
+                with st.lock:
+                    st.d["cursor"]["tg"] = u["update_id"]
+                    st.save()
                 m = u.get("message") or {}
                 if not m.get("text") or (m.get("from") or {}).get("is_bot") or m["text"].startswith("/"):
                     continue
                 who = (m.get("from") or {}).get("username") or (m.get("from") or {}).get("first_name", "someone")
-                thread = f"tg:{m['chat']['id']}"
-                intake("telegram", thread, who, m["text"], ext=f"tg{m['message_id']}")
-        except Exception:
+                # message_id is only unique within one chat, not globally — scope the dedup key by chat
+                # too, or two different chats' first messages (both id 1) would collide.
+                intake("telegram", f"tg:{m['chat']['id']}", who, m["text"], ext=f"tg{m['chat']['id']}:{m['message_id']}")
+        except Exception as e:
+            st.log("system", f"Telegram poll failed: {type(e).__name__}: {e}")
             time.sleep(3)
 
 
@@ -582,6 +664,15 @@ def github_loop():
                     continue
                 num = c["issue_url"].rsplit("/", 1)[1]
                 see(f"gh:{num}", login, c.get("body") or "", f"c{c['id']}")
+            # Inline review comments (commenting on a specific diff line) are a separate GitHub
+            # endpoint from the conversation comments above — without this, a Worker never sees them.
+            for c in gh("GET", f"/repos/{AGENT_REPO}/pulls/comments?since={since}&per_page=30"):
+                login = (c.get("user") or {}).get("login", "")
+                if login not in GH_TEAM and not login.endswith("[bot]"):
+                    continue
+                num = c["pull_request_url"].rsplit("/", 1)[1]
+                path_line = f" ({c['path']}:{c.get('line') or c.get('original_line')})" if c.get("path") else ""
+                see(f"gh:{num}", login, (c.get("body") or "") + path_line, f"rc{c['id']}")
             for pr in gh("GET", f"/repos/{AGENT_REPO}/pulls?state=all&sort=updated&direction=desc&per_page=10"):
                 num, sha = pr["number"], pr["head"]["sha"]
                 if pr.get("merged_at"):
@@ -596,30 +687,15 @@ def github_loop():
 
 # ------------------------------------------------------------------------------------------ Worker
 def brain_call(op, **k):
-    """A Worker thread calling back into this same process's state, in-process instead of over HTTP."""
+    """A Worker's own thread calling back into this same process's state, in-process instead of over HTTP."""
     with st.lock:
         d = st.d
-        w = d["workers"].get(k.get("wid"), {})
         if op == "inbox":
             items = d["inbox"].get(k["wid"], [])
             d["inbox"][k["wid"]] = []
             return items
-        if op == "log":
-            d["counts"]["spend"] += k.get("cost", 0)
-            d["counts"]["tokens"] += k.get("tokens", 0)
-            d["counts"]["worker_calls"] += 1
-            if k.get("text"):
-                st.log("worker", f"{k['wid']}: {k['text']}", worker=k["wid"])
-            return None
-        if op == "spill":
-            return st.spill(k["text"])
-        if op == "subscribe":
-            th = d["threads"].setdefault(k["thread"], {"id": k["thread"], "subscribers": [], "triggers": []})
-            if k["wid"] not in th["subscribers"]:
-                th["subscribers"].append(k["wid"])
-                w.setdefault("threads", []).append(k["thread"])
-            return None
         if op == "pr":
+            w = d["workers"][k["wid"]]
             w["pr"] = k["url"]
             th = d["threads"].setdefault(f"gh:{k['number']}", {"id": f"gh:{k['number']}", "subscribers": [], "triggers": []})
             if k["wid"] not in th["subscribers"]:
@@ -627,7 +703,15 @@ def brain_call(op, **k):
                 w.setdefault("threads", []).append(f"gh:{k['number']}")
             st.log("worker", f"{k['wid']} opened pull request #{k['number']}.", worker=k["wid"], url=k["url"])
             return None
+        if op == "subscribe":
+            th = d["threads"].setdefault(k["thread"], {"id": k["thread"], "subscribers": [], "triggers": []})
+            w = d["workers"][k["wid"]]
+            if k["wid"] not in th["subscribers"]:
+                th["subscribers"].append(k["wid"])
+                w.setdefault("threads", []).append(k["thread"])
+            return None
         if op == "report":
+            w = d["workers"][k["wid"]]
             w["status"] = {"confirmed": "done", "not_confirmed": "discarded"}.get(k["status"], "running")
             w["summary"] = k["summary"]
             d["queue"].append(f"REPORT from {k['wid']} (ticket {w.get('ticket_id','')}, kind {w.get('kind','')}): status={k['status']}. {k['summary']}" + (f" PR: {w.get('pr')}" if w.get("pr") else ""))
@@ -636,8 +720,89 @@ def brain_call(op, **k):
     return None
 
 
-def run_worker(wid, task, kind, policy, ticket_id, context):
-    """One container's worth of work, in a thread here. Clones the repo, fixes or implements, opens a PR."""
+def build_worker_session(wid, ticket_id, repo, kind, policy):
+    """Builds one round's tools and ClaudeAgentOptions. Called fresh for the initial round and for
+    every later resume round — a round is a new connection each time, not one held-open session, so
+    this closure (and the `done` flag it shares with the `report` tool) is rebuilt each time too."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    done = {"v": False}
+
+    @sdk.tool("open_pr", "Commit all changes, push and open a pull request.", {"branch": str, "title": str, "body": str})
+    async def open_pr(args):
+        subprocess.run(["git", "checkout", "-b", args["branch"]], cwd=repo, capture_output=True)
+        subprocess.run(["git", "add", "-A"], cwd=repo)
+        subprocess.run(["git", "commit", "-m", args["title"]], cwd=repo, capture_output=True)
+        subprocess.run(["git", "push", "-u", "origin", args["branch"]], cwd=repo, env=env, capture_output=True)
+        pr = gh("POST", f"/repos/{AGENT_REPO}/pulls", {"title": args["title"], "body": args["body"], "head": args["branch"], "base": "main"})
+        if "number" not in pr:
+            return {"content": [{"type": "text", "text": f"open_pr failed: {pr}"}], "is_error": True}
+        brain_call("pr", wid=wid, number=pr["number"], url=pr["html_url"])
+        if ticket_id:
+            try:  # the board's "View pull request" link reads pr_url; a Bug UI outage must not fail the PR
+                bugui_update(ticket_id, pr_url=pr["html_url"])
+            except Exception as e:
+                st.log("system", f"{wid}: could not record PR link on {ticket_id}: {type(e).__name__}", worker=wid)
+        return {"content": [{"type": "text", "text": f"opened pull request #{pr['number']}: {pr['html_url']}"}]}
+
+    @sdk.tool("push_changes", "Commit all changes and push them to the branch of your open pull request.", {"message": str})
+    async def push_changes(args):
+        subprocess.run(["git", "add", "-A"], cwd=repo)
+        subprocess.run(["git", "commit", "-m", args["message"]], cwd=repo, capture_output=True)
+        subprocess.run(["git", "push"], cwd=repo, env=env, capture_output=True)
+        return {"content": [{"type": "text", "text": "pushed"}]}
+
+    @sdk.tool("update_ticket", "Tell the Bug UI this ticket's current status.", {"status": str, "note": str})
+    async def update_ticket(args):
+        if ticket_id:
+            try:
+                bugui_update(ticket_id, status=args["status"], comment=args.get("note", ""))
+            except Exception as e:
+                return {"content": [{"type": "text", "text": f"update_ticket failed: {type(e).__name__}"}], "is_error": True}
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    @sdk.tool("subscribe", "Follow another Thread: its new events reach you directly.", {"thread": str})
+    async def subscribe(args):
+        brain_call("subscribe", wid=wid, thread=args["thread"])
+        return {"content": [{"type": "text", "text": "subscribed"}]}
+
+    @sdk.tool("report", "Report to the Router.", {"status": str, "summary": str})
+    async def report(args):
+        brain_call("report", wid=wid, status=args["status"], summary=args["summary"])
+        done["v"] = True
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    policy_line = "\nPolicy for this ticket: silent. Do not report or change anything without evidence." if policy == "silent" else ""
+    options = sdk.ClaudeAgentOptions(
+        model=WORKER_MODEL, system_prompt=WORKER_SYSTEM + policy_line, cwd=str(repo),
+        permission_mode="bypassPermissions", max_turns=40, max_budget_usd=SPEND_CAP,
+        hooks={"PreToolUse": [sdk.HookMatcher(matcher="Bash", hooks=[block_dangerous_bash])]},
+        mcp_servers={"worker": sdk.create_sdk_mcp_server(
+            "worker", tools=[open_pr, push_changes, update_ticket, subscribe, report])},
+        allowed_tools=["Read", "Write", "Edit", "Bash", "mcp__worker__open_pr", "mcp__worker__push_changes",
+                       "mcp__worker__update_ticket", "mcp__worker__subscribe", "mcp__worker__report"])
+    return options, done
+
+
+async def _drain_inbox(client, wid, done):
+    """Keeps feeding a still-connected client any inbox items that arrive while it's connected, so a
+    burst of near-together events reuses one round instead of opening a new one for each. Stops (and
+    lets the caller disconnect) as soon as the inbox is empty — it does not wait or poll; wake_worker
+    is what starts the next round whenever something new shows up after that."""
+    for _ in range(20):
+        if done["v"] or st.over_budget():
+            return
+        inbox = brain_call("inbox", wid=wid)
+        if not inbox:
+            return
+        await client.query("NEW EVENTS\n" + "\n\n".join(inbox))
+        async for msg in client.receive_response():
+            if isinstance(msg, sdk.ResultMessage):
+                st.spend(msg.total_cost_usd)
+
+
+async def run_worker_async(wid, task, kind, policy, ticket_id, context):
+    """The initial round: clone the repo, then work the ticket. Marked busy by do_start_worker before
+    this is spawned; run_worker's finally frees it once this round disconnects."""
     repo = WORK_ROOT / wid
     repo.parent.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
@@ -650,107 +815,45 @@ def run_worker(wid, task, kind, policy, ticket_id, context):
         brain_call("report", wid=wid, status="not_confirmed", summary=f"Could not prepare the repository: {type(e).__name__}")
         return
 
-    jobs = {}
+    options, done = build_worker_session(wid, ticket_id, repo, kind, policy)
+    async with sdk.ClaudeSDKClient(options=options) as client:
+        await client.query(f"TICKET kind={kind}\nTASK: {task}\n\n{context}")
+        async for msg in client.receive_response():
+            if isinstance(msg, sdk.ResultMessage):
+                st.spend(msg.total_cost_usd)
+        await _drain_inbox(client, wid, done)
 
-    def spill_cut(text):
-        if len(text) <= OUT_CUT:
-            return text
-        sid = brain_call("spill", wid=wid, text=text)
-        return text[:OUT_CUT] + f"\n... [cut, {len(text)} characters: rest -> read({sid})]"
 
-    def worker_tool(name, a):
-        if name == "list_files":
-            return "\n".join(str(p.relative_to(repo)) for p in repo.rglob("*") if p.is_file() and ".git" not in p.parts)
-        if name == "read_file":
-            try:
-                return (repo / a["path"]).read_text()[:OUT_CUT]
-            except Exception as e:
-                return f"error: {type(e).__name__}"
-        if name == "write_file":
-            p = repo / a["path"]
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(a["content"])
-            brain_call("log", wid=wid, text=f"Edits {a['path']}")
-            return "written"
-        if name == "start":
-            jid = f"J{len(jobs) + 1}"
-            jobs[jid] = subprocess.Popen(a["command"], shell=True, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            return jid
-        if name == "stop":
-            p = jobs.get(a["job"])
-            if p:
-                p.terminate()
-            return "stopped"
-        if name == "wait":
-            for jid, p in list(jobs.items()):
-                if p.poll() is not None:
-                    out, _ = p.communicate()
-                    del jobs[jid]
-                    return f"{jid} finished, exit {p.returncode}: {spill_cut(out or '')}"
-            time.sleep(2)
-            return "no background job finished; new events (if any) are in your inbox"
-        if name == "read":
-            return router_read(a["id"])
-        if name == "open_pr":
-            subprocess.run(["git", "checkout", "-b", a["branch"]], cwd=repo, capture_output=True)
-            subprocess.run(["git", "add", "-A"], cwd=repo)
-            subprocess.run(["git", "commit", "-m", a["title"]], cwd=repo, capture_output=True)
-            subprocess.run(["git", "push", "-u", "origin", a["branch"]], cwd=repo, env=env, capture_output=True)
-            pr = gh("POST", f"/repos/{AGENT_REPO}/pulls", {"title": a["title"], "body": a["body"], "head": a["branch"], "base": "main"})
-            if "number" not in pr:
-                return f"open_pr failed: {pr}"
-            brain_call("pr", wid=wid, number=pr["number"], url=pr["html_url"])
-            return f"opened pull request #{pr['number']}: {pr['html_url']}"
-        if name == "push_changes":
-            subprocess.run(["git", "add", "-A"], cwd=repo)
-            subprocess.run(["git", "commit", "-m", a["message"]], cwd=repo, capture_output=True)
-            subprocess.run(["git", "push"], cwd=repo, env=env, capture_output=True)
-            return "pushed"
-        if name == "subscribe":
-            brain_call("subscribe", wid=wid, thread=a["thread"])
-            return "subscribed"
-        if name == "update_ticket":
-            if ticket_id:
-                try:
-                    bugui_update(ticket_id, status=a["status"], comment=a.get("note", ""))
-                except Exception as e:
-                    return f"update_ticket failed: {type(e).__name__}"
-            return "ok"
-        if name == "report":
-            brain_call("report", wid=wid, status=a["status"], summary=a["summary"])
-            return "ok"
-        return "ok"
+async def run_worker_round_async(wid):
+    """A resume round: something new arrived for a Worker that had already gone idle. Reconnects —
+    a fresh session, not a continued conversation, so the prompt tells it to check its directory, git
+    log and any open pull request before repeating earlier work, the same caution a restarted Assignment
+    gets in the reference design this is built from."""
+    w = st.d["workers"].get(wid)
+    if not w or w.get("status") != "running":
+        return
+    inbox = brain_call("inbox", wid=wid)
+    if not inbox:
+        return
+    repo = WORK_ROOT / wid
+    options, done = build_worker_session(wid, w.get("ticket_id", ""), repo, w.get("kind", "bug"), w.get("policy", "normal"))
+    async with sdk.ClaudeSDKClient(options=options) as client:
+        await client.query(
+            f"You are resuming this ticket in a new session, not the one that did the earlier work.\n"
+            f"TICKET kind={w.get('kind','bug')}\nTASK: {w.get('task','')}\n\n"
+            "Check your directory, git log and any open pull request before repeating anything that "
+            "may already be done.\n\nNEW EVENTS\n" + "\n\n".join(inbox))
+        async for msg in client.receive_response():
+            if isinstance(msg, sdk.ResultMessage):
+                st.spend(msg.total_cost_usd)
+        await _drain_inbox(client, wid, done)
 
-    policy_line = "\nPolicy for this ticket: silent. Do not report or change anything without evidence." if policy == "silent" else ""
-    history = [{"role": "system", "content": WORKER_SYSTEM + policy_line},
-               {"role": "user", "content": f"TICKET kind={kind}\nTASK: {task}\n\n{context}"}]
-    for _ in range(40):
-        inbox = brain_call("inbox", wid=wid)
-        if inbox:
-            history.append({"role": "user", "content": "NEW EVENTS\n" + "\n\n".join(inbox)})
-        try:
-            msg, cost, use = llm(WORKER_MODEL, history, WORKER_TOOLS, 1500)
-        except Exception:
-            time.sleep(5)
-            continue
-        brain_call("log", wid=wid, cost=cost, tokens=use.get("total_tokens", 0), text="")
-        history.append({"role": "assistant", "content": msg.get("content") or "", **({"tool_calls": msg["tool_calls"]} if msg.get("tool_calls") else {})})
-        calls = msg.get("tool_calls") or []
-        if not calls:
-            history.append({"role": "user", "content": "Call a tool, or wait, or report."})
-            continue
-        done = False
-        for c in calls:
-            fn = c["function"]["name"]
-            try:
-                args = json.loads(c["function"]["arguments"] or "{}")
-            except ValueError:
-                args = {}
-            res = worker_tool(fn, args)
-            history.append({"role": "tool", "tool_call_id": c["id"], "content": str(res)})
-            done = done or fn == "report"
-        if done:
-            break
+
+def run_worker(wid, task, kind, policy, ticket_id, context):
+    try:
+        asyncio.run(run_worker_async(wid, task, kind, policy, ticket_id, context))
+    finally:
+        _mark_free(wid)
 
 
 # ------------------------------------------------------------------------------------------- API
@@ -762,7 +865,33 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "P
 def start():
     for f in (router_loop, telegram_loop, github_loop):
         threading.Thread(target=f, daemon=True).start()
-    st.log("system", "The brain is running.")
+    # A restart kills every in-progress round outright, with no clean shutdown — including one that
+    # was never waiting on a new event at all (it could have been mid-task, with real uncommitted
+    # changes on disk). So every "running" Worker gets resumed here, not just ones with something
+    # already queued: if its inbox is empty, give it a recovery note first, the same caution a
+    # restarted Assignment gets in the reference design — check the directory, git log and any open
+    # PR before deciding what, if anything, still needs doing.
+    #
+    # A Worker that had already ended (confirmed/not_confirmed) can still have messages stuck in its
+    # inbox from before intake()'s resume-on-follow-up logic existed, or from a Worker that ended
+    # between a message being queued and the next restart. Those are resumed here too — the one-time
+    # cost of also resuming a stray bot/CI message queued the same way is acceptable; the alternative
+    # is a person's real follow-up sitting there forever.
+    for wid, w in st.d["workers"].items():
+        has_inbox = bool(st.d["inbox"].get(wid))
+        if w.get("status") != "running":
+            if not has_inbox:
+                continue
+            w["status"] = "running"
+            st.log("router", f"{wid}'s ticket resumes at startup: a queued message predates when it could be resumed.", worker=wid)
+        if not has_inbox:
+            st.d["inbox"].setdefault(wid, []).append(
+                "RECOVERY: the brain restarted and may have interrupted you mid-task, with no chance "
+                "to report. Check your directory (git status/diff), git log, and whether a pull "
+                "request is already open before deciding what, if anything, still needs doing.")
+        wake_worker(wid)
+    st.save()
+    st.log("system", f"The brain is running on {ROUTER_MODEL} (Router/Filter) and {WORKER_MODEL} (Worker), spend cap ${SPEND_CAP}.")
 
 
 def auth(x, expected):
@@ -796,8 +925,7 @@ async def webhook_axiom(req: Request, x_axiom_token: str = Header("")):
 def events(after: int = -1, x_admin: str = Header("")):
     auth(x_admin, ADMIN_SECRET)
     d = st.d
-    return {"log": d["log"][after + 1:], "counts": d["counts"],
-            "workers": [{k: v for k, v in w.items() if k != "activity"} for w in d["workers"].values()]}
+    return {"log": d["log"][after + 1:], "counts": d["counts"], "workers": list(d["workers"].values())}
 
 
 @app.get("/health")
